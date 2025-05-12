@@ -6,6 +6,7 @@ import tkinter as tk
 from tkinter import messagebox, filedialog
 from datetime import datetime, timedelta
 import requests
+from mcrcon import MCRcon
 
 CONFIG_FILE = "config.txt"
 
@@ -13,13 +14,33 @@ CONFIG_FILE = "config.txt"
 WORLD_DIR = ""
 BACKUP_DIR = ""
 WEBHOOK_URL = ""
+RCON_HOST = ""
+RCON_PASSWORD = ""
+
+# Modülün yüklü olup olmadığını kontrol et
+try:
+    import mcrcon
+except ImportError:
+    print("mcrcon modülü yüklü değil. Yedekleme işlemi RCON ile çalışmayacak.")
+    mcrcon = None
 
 # Ayarları config.txt dosyasına yaz
 def write_config():
     with open(CONFIG_FILE, "w") as f:
         f.write(f"{WORLD_DIR}\n")
         f.write(f"{BACKUP_DIR}\n")
-        f.write(f"{WEBHOOK_URL}\n" if WEBHOOK_URL else "\n")
+        f.write(f"{WEBHOOK_URL}\n")
+        f.write(f"{RCON_HOST}\n")
+        f.write(f"{RCON_PASSWORD}\n")
+
+# RCON ile Minecraft'a mesaj gönderme
+def send_rcon_message(host, password, message):
+    if mcrcon is not None:
+        try:
+            with MCRcon(host, password) as mcr:
+                mcr.command(f"say {message}")
+        except Exception as e:
+            print("RCON mesaj gönderilemedi:", e)
 
 # Discord mesaj gönderme
 def send_discord_message(content):
@@ -33,20 +54,37 @@ def send_discord_message(content):
 def create_backup():
     try:
         timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+        short_time = time.strftime("%H:%M")
         backup_path = os.path.join(BACKUP_DIR, f"world_{timestamp}")
 
         def ignore_files(dir, files):
             return ['session.lock'] if 'session.lock' in files else []
 
+        # Klasörler ve dosyalar için yazma izni hatası kontrolü
+        if not os.access(WORLD_DIR, os.R_OK):
+            raise PermissionError(f"Dünya klasörüne okuma izni yok: {WORLD_DIR}")
+        if not os.access(BACKUP_DIR, os.W_OK):
+            raise PermissionError(f"Yedekleme klasörüne yazma izni yok: {BACKUP_DIR}")
+
         shutil.copytree(WORLD_DIR, backup_path, dirs_exist_ok=True, ignore=ignore_files)
         print("[OK] Yedekleme tamamlandı:", backup_path)
+
+        # RCON mesajı gönder (isteğe bağlı)
+        if RCON_HOST and RCON_PASSWORD:
+            send_rcon_message(RCON_HOST, RCON_PASSWORD, f"§a[Dünya Kaydedildi] ⏰ {short_time}")
+
+        # Discord mesajı gönder (isteğe bağlı)
         send_discord_message(f"✅ Yedekleme tamamlandı:\n📁 {backup_path}\n🕒 {timestamp}")
+
         return backup_path
+    except PermissionError as e:
+        print(f"[HATA] {e}")
+        send_discord_message(f"❌ Yedekleme hatası: {e}")
     except Exception as e:
         error_message = f"Yedekleme hatası: {e}"
         print(error_message)
         send_discord_message(f"❌ {error_message}")
-        return None
+    return None
 
 # Eski yedekleri sil
 def delete_old_backups(days=2):
@@ -78,7 +116,7 @@ class BackupApp:
         self.interval_minutes = 30
 
         master.title("Minecraft Yedekleme")
-        master.geometry("400x420")
+        master.geometry("400x440")
 
         self.status = tk.Label(master, text="Durum: Beklemede", fg="blue")
         self.status.pack(pady=10)
@@ -144,7 +182,6 @@ class BackupApp:
             backup_path = create_backup()
             if backup_path:
                 self.update_last_backup_time()
-
             for _ in range(self.interval_minutes * 60):
                 if not self.running:
                     break
@@ -171,7 +208,7 @@ class ConfigApp:
     def __init__(self, master):
         self.master = master
         master.title("Ayarları Yapılandır")
-        master.geometry("400x350")
+        master.geometry("400x450")
 
         tk.Label(master, text="Dünya Klasörü:").pack()
         self.world_dir_entry = tk.Entry(master, width=40)
@@ -187,6 +224,14 @@ class ConfigApp:
         self.webhook_entry = tk.Entry(master, width=40)
         self.webhook_entry.pack(pady=5)
 
+        tk.Label(master, text="RCON Host (Opsiyonel):").pack()
+        self.rcon_host_entry = tk.Entry(master, width=40)
+        self.rcon_host_entry.pack(pady=5)
+
+        tk.Label(master, text="RCON Şifre (Opsiyonel):").pack()
+        self.rcon_pass_entry = tk.Entry(master, width=40, show="*")
+        self.rcon_pass_entry.pack(pady=5)
+
         tk.Button(master, text="Kaydet ve Devam Et", command=self.save_settings).pack(pady=20)
 
         self.load_config()
@@ -200,6 +245,10 @@ class ConfigApp:
                     self.backup_dir_entry.insert(0, lines[1].strip())
                     if len(lines) > 2:
                         self.webhook_entry.insert(0, lines[2].strip())
+                    if len(lines) > 3:
+                        self.rcon_host_entry.insert(0, lines[3].strip())
+                    if len(lines) > 4:
+                        self.rcon_pass_entry.insert(0, lines[4].strip())
 
     def select_world_dir(self):
         folder = filedialog.askdirectory()
@@ -214,10 +263,12 @@ class ConfigApp:
             self.backup_dir_entry.insert(0, folder)
 
     def save_settings(self):
-        global WORLD_DIR, BACKUP_DIR, WEBHOOK_URL
+        global WORLD_DIR, BACKUP_DIR, WEBHOOK_URL, RCON_HOST, RCON_PASSWORD
         WORLD_DIR = self.world_dir_entry.get()
         BACKUP_DIR = self.backup_dir_entry.get()
         WEBHOOK_URL = self.webhook_entry.get().strip()
+        RCON_HOST = self.rcon_host_entry.get().strip()
+        RCON_PASSWORD = self.rcon_pass_entry.get().strip()
 
         if not WORLD_DIR or not BACKUP_DIR:
             messagebox.showerror("Hata", "Lütfen tüm klasörleri belirtin.")
